@@ -1,5 +1,6 @@
 use actix_web::{get, post, web, App, HttpResponse, HttpServer, Responder};
 use serde_derive::{Deserialize, Serialize};
+use dotenv::dotenv;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Bookmark {
@@ -25,11 +26,14 @@ async fn echo(req_body: String) -> impl Responder {
 }
 
 async fn manual_hello() -> impl Responder {
-    HttpResponse::Ok().body("Hey there!")
+    let helloWorld = std::env::var("HELLO_WORLD").expect("HELLO_WORLD must be set.");
+    HttpResponse::Ok().body(helloWorld)
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    dotenv().ok();
+
     HttpServer::new(|| {
         App::new()
             .service(bookmarks_by_id)
