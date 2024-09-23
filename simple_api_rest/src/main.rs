@@ -1,8 +1,22 @@
 use actix_web::{get, post, web, App, HttpResponse, HttpServer, Responder};
+use serde_derive::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Bookmark {
+    id: u32,
+    url: String,
+}
 
 #[get("by-id/{id}")]
-async fn hello(path: web::Path<(u32,)>) -> impl Responder {
-    HttpResponse::Ok().body(format!("{{ \"id\": {}, \"url\": \"https://blog.x5ff.xyz\" }}", path.into_inner().0))
+async fn bookmarks_by_id(path: web::Path<(u32,)>) -> impl Responder {
+    let id = path.into_inner().0;
+
+    let bookmark = Bookmark {
+        id: id,
+        url: "https://blog.x5ff.xyz".into(),
+    };
+
+    HttpResponse::Ok().json(bookmark)
 }
 
 #[post("/echo")]
@@ -18,7 +32,7 @@ async fn manual_hello() -> impl Responder {
 async fn main() -> std::io::Result<()> {
     HttpServer::new(|| {
         App::new()
-            .service(hello)
+            .service(bookmarks_by_id)
             .service(echo)
             .route("/hey", web::get().to(manual_hello))
     })
