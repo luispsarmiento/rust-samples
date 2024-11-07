@@ -1,10 +1,48 @@
-use actix_web::{http, web, App, HttpMessage, HttpRequest, HttpResponse, HttpServer};
+use std::sync::Arc;
+
+use actix_web::{http::{self, StatusCode}, web::{self, Data}, App, HttpMessage, HttpRequest, HttpResponse, HttpServer};
 use bytes::Bytes;
 use reqwest::{Body, Method};
 use serde_json::json;
-use futures::{stream::{self, StreamExt}, TryFutureExt};
+use futures::{stream::{self, StreamExt}, FutureExt, TryFutureExt};
+use futures::Future;
 
 use dotenv::dotenv;
+
+type AsyncFn = Box<dyn Fn(&HttpRequest) -> Box<dyn Future<Output = Result<(), HttpResponse>>>>;
+
+#[derive(Clone)]
+struct Filter {
+    filters: Vec<fn(_req: HttpRequest) -> Result<(), HttpResponse>>
+}
+
+impl Filter {
+    fn new() -> Self {
+        Filter {
+            filters: Vec::new(),
+        }
+    }
+
+    fn add(&self, filter: fn(_req: HttpRequest) -> Result<(), HttpResponse>) {
+        let mut filters = self.filters.clone();
+        filters.push(filter);
+    }
+
+    fn run(&self, _req: &HttpRequest) -> Result<(), HttpResponse> {
+        for filter in &self.filters {
+            let cloned_req = _req.clone();
+            
+            if let Err(response) = filter(cloned_req) {
+                return Err(response); // Retorna en caso de fallo en algún filtro
+            }
+        }
+        Ok(()) 
+    }
+}
+
+fn default_filter(_req: HttpRequest) -> Result<(), HttpResponse> {
+    return Ok(());
+}
 
 async fn send_request(uri: String, req: HttpRequest, mut payload: web::Payload) -> HttpResponse {
     let client = reqwest::Client::new();
@@ -51,12 +89,11 @@ async fn send_request(uri: String, req: HttpRequest, mut payload: web::Payload) 
     return HttpResponse::Ok().json(data_result);
 }
 
-async fn handle_request(_req: HttpRequest, mut payload: web::Payload) -> HttpResponse {
+async fn handle_request(_req: HttpRequest, mut payload: web::Payload, filters: web::Data<Filter>) -> HttpResponse {
     let service_name = std::env::var("PRINCIPAL_SERVICE_NAME").expect("PRINCIPAL_SERVICE_NAME must be set.");
     let service_address = std::env::var("PRINCIPAL_SERVICE_ADDRESS").expect("PRINCIPAL_SERVICE_NAME must be set.");
 
-    //TODO:
-    //May be some middlewares like Authentication and Authorization
+    filters.run(&_req.clone());
     
     let path = _req.path().to_string();
     let parts: Vec<&str> = path.split('/').collect();
@@ -89,8 +126,13 @@ async fn handle_request(_req: HttpRequest, mut payload: web::Payload) -> HttpRes
 async fn main() -> std::io::Result<()> {
     dotenv().ok();
 
-    HttpServer::new(|| {
-        App::new().service(web::resource(r"/{service_uri:([a-zA-Z0-9._~:/?#@!$&'()*+,;=%-]*)?}").route(web::to(handle_request)))
+    let filters = Filter::new();
+    filters.add(default_filter);
+
+    HttpServer::new(move || {
+        App::new().service(web::resource(r"/{service_uri:([a-zA-Z0-9._~:/?#@!$&'()*+,;=%-]*)?}")
+                  .app_data(Data::new(filters.clone()))
+                  .route(web::to(handle_request)))
     })
     .bind(("127.0.0.1", 8080))?
     .run()
