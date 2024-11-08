@@ -1,47 +1,47 @@
-use std::sync::Arc;
+use std::{any, sync::{Arc, RwLock}};
 
-use actix_web::{http::{self, StatusCode}, web::{self, Data}, App, HttpMessage, HttpRequest, HttpResponse, HttpServer};
+use actix_web::{dev::AppService, web::{self, Data}, App, HttpRequest, HttpResponse, HttpServer, Resource};
 use bytes::Bytes;
 use reqwest::{Body, Method};
-use serde_json::json;
-use futures::{stream::{self, StreamExt}, FutureExt, TryFutureExt};
+use futures::stream::StreamExt;
 use futures::Future;
 
 use dotenv::dotenv;
 
-type AsyncFn = Box<dyn Fn(&HttpRequest) -> Box<dyn Future<Output = Result<(), HttpResponse>>>>;
-
 #[derive(Clone)]
 struct Filter {
-    filters: Vec<fn(_req: HttpRequest) -> Result<(), HttpResponse>>
+    filters: Arc<RwLock<Vec<fn(_req: HttpRequest) -> Result<(), HttpResponse>>>>
 }
 
 impl Filter {
     fn new() -> Self {
         Filter {
-            filters: Vec::new(),
+            filters: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
-    fn add(&self, filter: fn(_req: HttpRequest) -> Result<(), HttpResponse>) {
-        let mut filters = self.filters.clone();
+    fn add(&self, filter: fn(_req: HttpRequest) -> Result<(), HttpResponse>) -> Self {
+        let mut filters = self.filters.write().unwrap();
         filters.push(filter);
+
+        self.clone() 
     }
 
-    fn run(&self, _req: &HttpRequest) -> Result<(), HttpResponse> {
-        for filter in &self.filters {
+    fn run(&self, _req: &HttpRequest) -> Result<bool, HttpResponse> {
+        let mut filters = self.filters.write().unwrap();
+        for filter in filters.iter() {
             let cloned_req = _req.clone();
             
             if let Err(response) = filter(cloned_req) {
-                return Err(response); // Retorna en caso de fallo en algún filtro
+                return Err(response);
             }
         }
-        Ok(()) 
+        Ok(true) 
     }
 }
 
 fn default_filter(_req: HttpRequest) -> Result<(), HttpResponse> {
-    return Ok(());
+    return Ok(())
 }
 
 async fn send_request(uri: String, req: HttpRequest, mut payload: web::Payload) -> HttpResponse {
@@ -71,14 +71,7 @@ async fn send_request(uri: String, req: HttpRequest, mut payload: web::Payload) 
                                             .send().await;
 
     let body_bytes = res.expect("Internal service error").text().await.unwrap().to_string().into_bytes();
-    //let data_result: Result<serde_json::Value, _> = serde_json::from_slice(&body_bytes);
-    
-    //let mut data = match data_result {
-    //    Ok(d) => d,
-    //    Err(_) => {
-    //        return HttpResponse::BadGateway().body("Failed to parse upstream response")
-    //    }
-    //};
+
     let data_result: serde_json::Value = if body_bytes.is_empty() {
         serde_json::json!({}) // Return a empty JSON
     } else {
@@ -89,11 +82,16 @@ async fn send_request(uri: String, req: HttpRequest, mut payload: web::Payload) 
     return HttpResponse::Ok().json(data_result);
 }
 
-async fn handle_request(_req: HttpRequest, mut payload: web::Payload, filters: web::Data<Filter>) -> HttpResponse {
+async fn handle_request(_req: HttpRequest, mut payload: web::Payload, filters: web::Data<Arc<Filter>>) -> HttpResponse {
     let service_name = std::env::var("PRINCIPAL_SERVICE_NAME").expect("PRINCIPAL_SERVICE_NAME must be set.");
     let service_address = std::env::var("PRINCIPAL_SERVICE_ADDRESS").expect("PRINCIPAL_SERVICE_NAME must be set.");
 
-    filters.run(&_req.clone());
+    let _ = match filters.run(&_req.clone()) {
+        Ok(valid) => valid,
+        Err(err) => {
+            return err
+        }
+    };
     
     let path = _req.path().to_string();
     let parts: Vec<&str> = path.split('/').collect();
@@ -122,18 +120,39 @@ async fn handle_request(_req: HttpRequest, mut payload: web::Payload, filters: w
     }
 }
 
+#[derive(Clone)]
+struct APIGateway {
+    filters: Arc<Filter>,
+}
+
+impl APIGateway {
+    fn new() -> Self {
+        dotenv().ok();
+
+        let filters = Filter::new();
+        filters.add(default_filter);
+
+        APIGateway {
+            filters: Arc::new(filters),
+        }
+    }
+    
+    fn resource_service_uri(&self) -> Resource {
+        return web::resource(r"/{service_uri:([a-zA-Z0-9._~:/?#@!$&'()*+,;=%-]*)?}")
+                    .app_data(Data::new(Arc::clone(&self.filters.clone())))
+                    .route(web::to(handle_request))
+    }
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    dotenv().ok();
-
-    let filters = Filter::new();
-    filters.add(default_filter);
-
-    HttpServer::new(move || {
-        App::new().service(web::resource(r"/{service_uri:([a-zA-Z0-9._~:/?#@!$&'()*+,;=%-]*)?}")
-                  .app_data(Data::new(filters.clone()))
-                  .route(web::to(handle_request)))
-    })
+    let api_gateway = APIGateway::new();
+    
+    let app = move || {
+        App::new().service(api_gateway.resource_service_uri())
+    };
+    
+    HttpServer::new(app)
     .bind(("127.0.0.1", 8080))?
     .run()
     .await
